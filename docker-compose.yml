@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  logging:
+    build: ./logging
+    ports:
+      - "8001:8000"
+
+  counter:
+    build: ./counter
+    ports:
+      - "8002:8000"
+
+  facade:
+    build: ./facade
+    ports:
+      - "8000:8000"
+    depends_on:
+      - logging
+      - counter
