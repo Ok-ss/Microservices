@@ -26,6 +26,7 @@ async def send_transaction(data: ClientTransaction):
     global log_time_total, counter_time_total
 
     tx = {
+        "transaction_id": str(uuid.uuid4()),
         "timestamp": str(time.time()),
         "user_id": data.user_id,
         "amount": data.amount,
