@@ -1,10 +1,11 @@
-# facade/main.py
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 import httpx
 import time
 import uuid
+import random
+import httpx
+import hazelcast
 
 app = FastAPI()
 
@@ -20,66 +21,83 @@ class ClientTransaction(BaseModel):
     user_id: str
     amount: int
 
+hz_client = hazelcast.HazelcastClient(cluster_members=["hazelcast:5701"])
+queue = hz_client.get_queue("counter_queue").blocking()
+print(queue)
+
+async def get_service_url(service_name: str):
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"http://config-server:8888/nodes/{service_name}")
+        ips = resp.json()
+        if not ips:
+            raise Exception(f"No instances of {service_name} found")
+        selected_ip = random.choice(ips)
+        return f"http://{selected_ip}:8000"
+
 @app.post("/send")
 async def send_transaction(data: ClientTransaction):
-
-    global log_time_total, counter_time_total
-
     tx = {
         "transaction_id": str(uuid.uuid4()),
-        "timestamp": str(time.time()),
         "user_id": data.user_id,
         "amount": data.amount,
     }
-
+    
+    log_url = await get_service_url("logging")
     async with httpx.AsyncClient() as client:
+        await client.post(f"{log_url}/log", json=tx)
 
-        start = time.perf_counter()
-        await client.post("http://logging:8000/log", json=tx)
-        log_time_total += time.perf_counter() - start
+    queue.put(tx) 
 
-        start = time.perf_counter()
-        response = await client.post("http://counter:8000/update", json=tx)
-        counter_time_total += time.perf_counter() - start
+    return {"status": "Transaction queued", "transaction_id": tx["transaction_id"]}
 
-    return {
-        "transaction_id": tx["timestamp"],
-        "balance": response.json()["balance"]
-    }
 
 @app.get("/user/{user_id}")
 async def get_user_data(user_id: str):
     global transactions_time_total, balances_time_total
+    transactions = []
+    balance = None 
 
     async with httpx.AsyncClient() as client:
-        start = time.perf_counter()
-        transactions_resp = await client.get(f"http://logging:8000/logs/{user_id}")
-        transactions_time_total += time.perf_counter() - start
+        try:
+            log_url = await get_service_url("logging")
+            start = time.perf_counter()
+            transactions_resp = await client.get(f"{log_url}/logs/{user_id}", timeout=2.0)
+            transactions = transactions_resp.json()
+            transactions_time_total += time.perf_counter() - start
+        except Exception as e:
+            print(f"Logging service error: {e}")
+            transactions = []
 
-        start = time.perf_counter()
-        balance_resp = await client.get(f"http://counter:8000/user/{user_id}")
-        balances_time_total += time.perf_counter() - start
+        try:
+            counter_url = await get_service_url("counter")
+            start = time.perf_counter()
+            balance_resp = await client.get(f"{counter_url}/user/{user_id}", timeout=2.0)
+            balance = balance_resp.json().get("balance")
+            balances_time_total += time.perf_counter() - start
+        except Exception as e:
+            print(f"Counter service unreachable: {e}")
+            balance = None
 
     return {
-        "balance": balance_resp.json()["balance"],
-        "transactions": transactions_resp.json()  # just the list
+        "balance": balance,
+        "transactions": transactions
     }
 
 @app.get("/accounts")
 async def get_all_accounts():
-    """
-    Fetch balances of all clients from counter-service
-    """
     global all_accounts_time_total
-    
-    async with httpx.AsyncClient() as client:
-        start = time.perf_counter()
-        response = await client.get("http://counter:8000/accounts")
-        all_accounts_time_total += time.perf_counter() - start
 
+    try:
+        counter_url = await get_service_url("counter")
+        async with httpx.AsyncClient() as client:
+            start = time.perf_counter()
+            response = await client.get(f"{counter_url}/accounts", timeout=5.0)
+            all_accounts_time_total += time.perf_counter() - start
+            return response.json()
+    except Exception as e:
+        print(f"Failed to fetch accounts: {e}")
+        return {}
 
-    # counter-service already returns a dict like {"user1": 100, "user2": 50}
-    return response.json()
 
 @app.get("/metrics")
 def metrics():

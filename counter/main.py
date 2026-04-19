@@ -1,15 +1,14 @@
-# counter/main.py
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import create_engine, Column, String, Integer, select
-from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from sqlalchemy.orm import declarative_base, sessionmaker
 import os
+import threading
+import hazelcast
+import httpx
+from contextlib import asynccontextmanager
 
-app = FastAPI()
-
-# Database setup
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://counter_user:counter_pass@localhost:5432/counter_db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://counter_user:counter_pass@postgres:5432/counter_db")
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
@@ -23,36 +22,77 @@ Base.metadata.create_all(engine)
 
 class Transaction(BaseModel):
     transaction_id: str
-    timestamp: str
     user_id: str
     amount: int
 
-@app.post("/update")
-def update_balance(tx: Transaction):
+def save_to_db(tx_data: dict):
     db = SessionLocal()
     try:
-        # SELECT FOR UPDATE locks the row during transaction.
-        # This prevents concurrent updates from causing lost writes.
+        user_id = tx_data.get("user_id")
+        amount = tx_data.get("amount")
+        
         result = db.execute(
-            select(Account).where(Account.user_id == tx.user_id).with_for_update()
+            select(Account).where(Account.user_id == user_id).with_for_update()
         )
         account = result.scalar_one_or_none()
         
         if account is None:
-            # Create new account if it doesn't exist
-            account = Account(user_id=tx.user_id, balance=tx.amount)
+            account = Account(user_id=user_id, balance=amount)
             db.add(account)
         else:
-            account.balance += tx.amount
+            account.balance += amount
         
         db.commit()
         db.refresh(account)
-        return {"balance": account.balance}
+        print(f" [DB] Updated {user_id}: new balance {account.balance}")
+        return account.balance
     except Exception as e:
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f" [DB ERROR] {e}")
+        return None
     finally:
         db.close()
+
+def consume_queue():
+    try:
+        hz_client = hazelcast.HazelcastClient(cluster_members=["hazelcast:5701"])
+        queue = hz_client.get_queue("counter_queue").blocking()
+        print(queue)
+        print(" [MQ] Consumer started, waiting for messages...")
+
+        while True:
+            tx_data = queue.take()
+            print(f" [MQ] Received transaction for user: {tx_data.get('user_id')}")
+            save_to_db(tx_data)
+    except Exception as e:
+        print(f" [MQ ERROR] Consumer crashed: {e}")
+
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    thread = threading.Thread(target=consume_queue, daemon=True)
+    thread.start()
+
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post("http://config-server:8888/register?service_name=counter")
+            print(" [REG] Registered with Config Server")
+        except Exception as e:
+            print(f" [REG ERROR] Registration failed: {e}")
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+
+
+@app.post("/update")
+def update_balance(tx: Transaction):
+    """Manual update endpoint (still works for testing)"""
+    balance = save_to_db(tx.dict())
+    if balance is None:
+        raise HTTPException(status_code=500, detail="Database update failed")
+    return {"balance": balance}
 
 @app.get("/user/{user_id}")
 def get_balance(user_id: str):

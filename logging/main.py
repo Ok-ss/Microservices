@@ -1,14 +1,25 @@
-# logging/main.py
-
 from fastapi import FastAPI
 from pydantic import BaseModel
 from typing import Dict, List
 import hazelcast
 import socket
+import httpx
+import asyncio
+from contextlib import asynccontextmanager
 
-app = FastAPI()
 
-# Hazelcast client
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    async with httpx.AsyncClient() as client:
+        try:
+            await client.post("http://config-server:8888/register?service_name=logging")
+        except Exception as e:
+            print(f"Registration failed: {e}")
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+
 client = hazelcast.HazelcastClient(
     cluster_members=["hazelcast:5701"]
 )
@@ -26,7 +37,6 @@ class Transaction(BaseModel):
 def log_transaction(tx: Transaction):
     tx_dict = tx.dict()
     tx_dict["instance_id"] = instance_id
-    # put_if_absent is atomic in Hazelcast, so thread-safe.
     existing = transactions_map.put_if_absent(tx.transaction_id, tx_dict)
     if existing is not None:
         return {"status": "duplicate"}
