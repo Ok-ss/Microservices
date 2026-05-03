@@ -1,51 +1,34 @@
+import os
+import socket
+import time
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Dict, List
-import hazelcast
-import socket
-import httpx
-import asyncio
-from contextlib import asynccontextmanager
+from hazelcast import HazelcastClient
 
+app = FastAPI()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    async with httpx.AsyncClient() as client:
-        try:
-            await client.post("http://config-server:8888/register?service_name=logging")
-        except Exception as e:
-            print(f"Registration failed: {e}")
-    yield
-
-app = FastAPI(lifespan=lifespan)
-
-
-client = hazelcast.HazelcastClient(
-    cluster_members=["hazelcast:5701"]
-)
-transactions_map = client.get_map("transactions").blocking()
-
+HZ_MEMBERS = os.getenv("HAZELCAST_MEMBERS", "hazelcast-service:5701")
 instance_id = socket.gethostname()
+
+client = HazelcastClient(cluster_members=[HZ_MEMBERS])
+transactions_map = client.get_map("transactions").blocking()
 
 class Transaction(BaseModel):
     transaction_id: str
-    timestamp: str
     user_id: str
     amount: int
+    timestamp: str
 
 @app.post("/log")
-def log_transaction(tx: Transaction):
-    tx_dict = tx.dict()
-    tx_dict["instance_id"] = instance_id
-    existing = transactions_map.put_if_absent(tx.transaction_id, tx_dict)
-    if existing is not None:
-        return {"status": "duplicate"}
-    return {"status": "stored"}
+def log_transaction(tx: dict):
+    print(tx)
+    tx_id = tx.get("transaction_id", str(time.time()))
+    tx["processed_by"] = instance_id
+    
+    transactions_map.put(tx_id, tx)
+    return {"status": "logged", "pod": instance_id}
 
 @app.get("/logs/{user_id}")
-def get_user_logs(user_id: str):
-    all_txs = transactions_map.values()
-    return [
-        tx for tx in all_txs
-        if tx["user_id"] == user_id
-    ]
+def get_logs(user_id: str):
+    all_values = transactions_map.values()
+    return [t for t in all_values if t["user_id"] == user_id]
